@@ -77,9 +77,11 @@ licence or other restriction of which You are aware, and marking it clearly as
 
 ## Signing
 
-Comment on your pull request with:
+Comment on your pull request with exactly this line:
 
-> I have read the CLA document and I hereby sign the CLA.
+> I have read the CLA Document and I hereby sign the CLA
 
-This records your agreement against your GitHub identity and covers all of your
-Contributions to the Project, past and future.
+The comparison is exact — copy the line rather than retyping it. Your signature
+is then committed to `signatures/version1/cla.json` in this repository, recorded
+against your GitHub identity, and covers all of your Contributions to the
+Project, past and future.

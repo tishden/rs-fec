@@ -10,13 +10,19 @@ Code contributions require a signed Contributor License Agreement
 not an assignment: you keep the copyright in what you write, and you grant me
 the right to relicense the project as a whole later.
 
-To sign, comment on your pull request with:
+To sign, comment on your pull request with exactly this line:
 
 ```
-I have read the CLA document and I hereby sign the CLA.
+I have read the CLA Document and I hereby sign the CLA
 ```
 
-You only sign once; it covers all of your future contributions here.
+A bot posts the same instruction on any pull request that needs it, and a
+status check keeps the PR unmergeable until every author on it has signed. The
+comparison is exact — no trailing period, capital D in "Document" — so copy the
+line rather than retyping it. If the check does not update, comment `recheck`.
+
+You only sign once; your signature is recorded in `signatures/version1/cla.json`
+in this repository and covers all of your future contributions here.
 
 If your employer owns work you do, get their sign-off before contributing —
 the CLA asks you to confirm you have the right to grant these terms.

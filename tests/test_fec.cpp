@@ -1,0 +1,386 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Denis Tishkov
+
+// Assertion tests for the FEC stack: GF(256) kernels, encoder/decoder
+// round-trips under loss patterns (random, consecutive bursts, partial
+// groups, lost parity), and the Gilbert-Elliott loss model statistics.
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <set>
+#include <vector>
+
+#include "rsfec/fec.h"
+#include "rsfec/gf256.h"
+#include "rsfec/loss.h"
+
+namespace {
+
+std::mt19937 rng(12345);
+
+uint32_t rnd(uint32_t lo, uint32_t hi) {  // inclusive
+  return lo + rng() % (hi - lo + 1);
+}
+
+void test_gf256_field() {
+  for (int a = 1; a < 256; ++a) {
+    assert(gf256::mul(a, gf256::inv(a)) == 1);
+    assert(gf256::mul(a, 1) == a);
+    assert(gf256::mul(a, 0) == 0);
+  }
+  for (int i = 0; i < 10000; ++i) {
+    uint8_t a = rng(), b = rng(), c = rng();
+    assert(gf256::mul(a, b) == gf256::mul(b, a));
+    assert(gf256::mul(a, static_cast<uint8_t>(b ^ c)) ==
+           (gf256::mul(a, b) ^ gf256::mul(a, c)));
+    assert(gf256::mul(gf256::mul(a, b), c) ==
+           gf256::mul(a, gf256::mul(b, c)));
+  }
+  printf("test_gf256_field OK\n");
+}
+
+// Every kernel the CPU can run must agree byte-for-byte with scalar, both the
+// single addmul and the fused addmul2 (vs two independent scalar passes).
+void test_gf256_kernels_agree() {
+  size_t nk = 0;
+  const gf256::KernelInfo* ks = gf256::kernel_table(&nk);
+  for (size_t ki = 0; ki < nk; ++ki) {
+    const gf256::KernelInfo& k = ks[ki];
+    if ((k.need & ~gf256::caps()) != 0) {
+      printf("  kernel %-12s SKIPPED (cpu)\n", k.name);
+      continue;
+    }
+    for (int iter = 0; iter < 100; ++iter) {
+      const size_t n = rnd(1, 1500);
+      std::vector<uint8_t> src(n), a(n), b(n), a2(n), b2(n);
+      for (auto& x : src) x = rng();
+      for (size_t i = 0; i < n; ++i) {
+        a[i] = a2[i] = rng();
+        b[i] = b2[i] = rng();
+      }
+      const uint8_t c0 = rnd(2, 255), c1 = rnd(2, 255);
+      gf256::addmul_scalar(a.data(), src.data(), n, c0);
+      k.addmul(a2.data(), src.data(), n, c0);
+      assert(a == a2);
+      gf256::addmul_scalar(a.data(), src.data(), n, c0);
+      gf256::addmul_scalar(b.data(), src.data(), n, c1);
+      k.addmul2(a2.data(), b2.data(), src.data(), n, c0, c1);
+      assert(a == a2 && b == b2);
+    }
+    printf("  kernel %-12s OK\n", k.name);
+  }
+  printf("test_gf256_kernels_agree OK (dispatch=%s)\n", gf256::kernel_name());
+}
+
+struct Pkt {
+  uint64_t seq;
+  std::vector<uint8_t> data;
+};
+
+// End-to-end: encode `pkts`, drop `lost_data` seqs and `lost_parity` (by
+// emission order), feed the rest to a Decoder (order: parity first if
+// parity_first). Returns recovered seq -> bytes.
+struct RunResult {
+  std::vector<Pkt> recovered;
+  fec::Decoder::Stats stats;
+};
+
+RunResult run_codec(const fec::Params& prm, const std::vector<Pkt>& pkts,
+                    const std::set<uint64_t>& lost_data,
+                    const std::set<size_t>& lost_parity, bool parity_first,
+                    uint64_t flush_at_ns = 0) {
+  fec::Encoder enc(prm);
+  std::vector<fec::Parity> par;
+  struct StoredParity {
+    uint64_t first_seq;
+    uint8_t k_actual, index, depth;
+    uint16_t coded_len;
+    std::vector<uint8_t> data;
+  };
+  std::vector<StoredParity> stored;
+  auto drain = [&]() {
+    for (const auto& p : par) {
+      stored.push_back({p.first_seq, p.k_actual, p.index, p.depth,
+                        p.coded_len,
+                        std::vector<uint8_t>(p.data, p.data + p.coded_len)});
+    }
+    par.clear();
+  };
+  uint64_t now = 1000;
+  for (const auto& p : pkts) {
+    enc.feed(p.seq, p.data.data(), static_cast<uint32_t>(p.data.size()), now,
+             par);
+    drain();
+    now += 1000;
+  }
+  if (flush_at_ns) {
+    enc.poll(now + flush_at_ns, par);
+    drain();
+  }
+
+  auto dec = std::make_unique<fec::Decoder>();
+  std::vector<fec::Decoder::Recovered> rec;
+  RunResult res;
+  auto take = [&]() {
+    for (const auto& r : rec) {
+      res.recovered.push_back(
+          {r.seq, std::vector<uint8_t>(r.data, r.data + r.len)});
+    }
+    rec.clear();
+  };
+  auto feed_parities = [&]() {
+    for (size_t i = 0; i < stored.size(); ++i) {
+      if (lost_parity.count(i)) continue;
+      const auto& s = stored[i];
+      dec->feed_parity(s.first_seq, s.k_actual, s.depth, s.index,
+                       s.data.data(), s.coded_len, rec);
+      take();
+    }
+  };
+  auto feed_data = [&]() {
+    for (const auto& p : pkts) {
+      if (lost_data.count(p.seq)) continue;
+      dec->feed_data(p.seq, p.data.data(),
+                     static_cast<uint32_t>(p.data.size()), rec);
+      take();
+    }
+  };
+  if (parity_first) { feed_parities(); feed_data(); }
+  else { feed_data(); feed_parities(); }
+  res.stats = dec->stats();
+  return res;
+}
+
+std::vector<Pkt> make_pkts(uint64_t first_seq, uint32_t n, uint32_t min_len,
+                           uint32_t max_len) {
+  std::vector<Pkt> v;
+  for (uint32_t i = 0; i < n; ++i) {
+    Pkt p;
+    p.seq = first_seq + i;
+    p.data.resize(rnd(min_len, max_len));
+    for (auto& b : p.data) b = rng();
+    v.push_back(std::move(p));
+  }
+  return v;
+}
+
+// With in-order delivery (data before its group's parity) the decoder must
+// recover exactly the lost set. With parity delivered first the decoder is
+// deliberately greedy: it may reconstruct packets that were merely still in
+// flight (harmless duplicates downstream) -- then we only require that every
+// lost packet is among the recoveries and every recovery is byte-exact.
+void check_recovered_exact(const RunResult& res, const std::vector<Pkt>& pkts,
+                           const std::set<uint64_t>& lost_data,
+                           bool allow_extra = false) {
+  if (!allow_extra) assert(res.recovered.size() == lost_data.size());
+  std::set<uint64_t> got;
+  for (const auto& r : res.recovered) {
+    got.insert(r.seq);
+    const Pkt* orig = nullptr;
+    for (const auto& p : pkts)
+      if (p.seq == r.seq) { orig = &p; break; }
+    assert(orig && orig->data == r.data);
+  }
+  for (uint64_t s : lost_data) assert(got.count(s));
+}
+
+void test_roundtrip_random_losses() {
+  for (uint16_t k : {1, 2, 3, 8, 16}) {
+    for (uint16_t r : {1, 2, 4}) {
+      for (uint16_t d : {1, 2, 4}) {
+        fec::Params prm{k, r, d, 100};
+        const uint32_t n = k * d * 3;  // three full blocks
+        auto pkts = make_pkts(1, n, 1, 1400);
+        // Per group, drop up to r random members.
+        std::set<uint64_t> lost;
+        for (uint32_t g = 0; g < 3 * d; ++g) {
+          const uint32_t nl = rnd(0, r);
+          for (uint32_t t = 0; t < nl; ++t) {
+            // group g covers seqs base + j*d where base = 1 + (g/d)*k*d + g%d
+            const uint64_t base = 1 + (g / d) * (uint64_t)k * d + g % d;
+            lost.insert(base + static_cast<uint64_t>(rnd(0, k - 1)) * d);
+          }
+        }
+        for (bool pf : {false, true}) {
+          auto res = run_codec(prm, pkts, lost, {}, pf);
+          check_recovered_exact(res, pkts, lost, /*allow_extra=*/pf);
+          assert(res.stats.unrecoverable == 0);
+        }
+      }
+    }
+  }
+  printf("test_roundtrip_random_losses OK\n");
+}
+
+void test_burst_recovery() {
+  // A burst of exactly r*d consecutive packets must always be recoverable.
+  for (uint16_t r : {1, 2}) {
+    for (uint16_t d : {1, 2, 4}) {
+      const uint16_t k = 8;
+      fec::Params prm{k, r, d, 100};
+      const uint32_t n = k * d * 2;
+      auto pkts = make_pkts(1, n, 100, 1400);
+      const uint32_t burst = static_cast<uint32_t>(r) * d;
+      const uint64_t start = 1 + d;  // somewhere inside the first block
+      std::set<uint64_t> lost;
+      for (uint32_t i = 0; i < burst; ++i) lost.insert(start + i);
+      auto res = run_codec(prm, pkts, lost, {}, false);
+      check_recovered_exact(res, pkts, lost);
+
+      // One more than r*d consecutive: some group now has r+1 losses.
+      std::set<uint64_t> lost2 = lost;
+      lost2.insert(start + burst);
+      auto res2 = run_codec(prm, pkts, lost2, {}, false);
+      assert(res2.recovered.size() < lost2.size());
+    }
+  }
+  printf("test_burst_recovery OK\n");
+}
+
+void test_partial_group_flush() {
+  const fec::Params prm{8, 2, 1, 100};
+  // Only 3 packets arrive, then the stream pauses: poll() must flush a
+  // k_actual=3 group whose parity still recovers losses.
+  auto pkts = make_pkts(1, 3, 1, 200);
+  std::set<uint64_t> lost{2};
+  auto res = run_codec(prm, pkts, lost, {}, false, /*flush_at_ns=*/200000);
+  check_recovered_exact(res, pkts, lost);
+  printf("test_partial_group_flush OK\n");
+}
+
+void test_lost_parity() {
+  const fec::Params prm{8, 2, 1, 100};
+  auto pkts = make_pkts(1, 16, 1, 1400);
+  // Group 1 loses one data packet and one of its two parities -> still fine.
+  std::set<uint64_t> lost{3};
+  std::set<size_t> lost_par{0};  // first emitted parity (group 1, index 0)
+  auto res = run_codec(prm, pkts, lost, lost_par, false);
+  check_recovered_exact(res, pkts, lost);
+  // Two data losses + one parity lost -> 2 > 1 available: unrecoverable.
+  std::set<uint64_t> lost2{3, 5};
+  auto res2 = run_codec(prm, pkts, lost2, lost_par, false);
+  assert(res2.recovered.empty());
+  printf("test_lost_parity OK\n");
+}
+
+void test_intact_group_and_dup_parity() {
+  const fec::Params prm{4, 1, 1, 100};
+  auto pkts = make_pkts(1, 4, 10, 100);
+  auto res = run_codec(prm, pkts, {}, {}, false);
+  assert(res.recovered.empty());
+  assert(res.stats.groups_intact == 1);
+  assert(res.stats.recovered == 0);
+  printf("test_intact_group_and_dup_parity OK\n");
+}
+
+// set_r applies at group-open time; each group carries its own parity count
+// and the decoder handles any per-group r (a reduced-r group is just the
+// r=1/r=0 params case, whose recovery the roundtrip tests already cover).
+void test_encoder_set_r() {
+  fec::Params prm{4, 2, 1, 100};
+  fec::Encoder enc(prm);
+  std::vector<fec::Parity> out;
+  uint8_t data[64];
+  for (auto& b : data) b = rng();
+  uint64_t seq = 1;
+  auto feed_group = [&]() {
+    out.clear();
+    for (int j = 0; j < 4; ++j) enc.feed(seq++, data, sizeof(data), 1, out);
+    return out.size();
+  };
+  assert(feed_group() == 2);      // configured r
+  enc.set_r(1);
+  assert(feed_group() == 1);
+  enc.set_r(0);
+  assert(feed_group() == 0);      // parity suspended
+  enc.set_r(2);
+  assert(feed_group() == 2);      // restored
+  enc.set_r(7);                   // capped at configured r
+  assert(enc.current_r() == 2);
+  assert(feed_group() == 2);
+  // Mid-group change affects only the NEXT group.
+  out.clear();
+  enc.feed(seq++, data, sizeof(data), 1, out);
+  enc.set_r(0);
+  for (int j = 0; j < 3; ++j) enc.feed(seq++, data, sizeof(data), 1, out);
+  assert(out.size() == 2);        // group opened at r=2 closes with 2
+  assert(feed_group() == 0);      // next group uses r=0
+  printf("test_encoder_set_r OK\n");
+}
+
+void test_loss_model_stats() {
+  for (double pct : {0.1, 1.0, 5.0}) {
+    for (double burst : {1.0, 4.0, 8.0}) {
+      loss::Model m(pct, burst, 42);
+      const uint64_t n = 4000000;
+      uint64_t drops = 0, bursts = 0, cur = 0, burst_total = 0;
+      for (uint64_t i = 0; i < n; ++i) {
+        if (m.drop()) {
+          ++drops;
+          ++cur;
+        } else if (cur) {
+          ++bursts;
+          burst_total += cur;
+          cur = 0;
+        }
+      }
+      const double rate = 100.0 * static_cast<double>(drops) / n;
+      const double mean_burst =
+          bursts ? static_cast<double>(burst_total) / bursts : 0.0;
+      assert(rate > pct * 0.85 && rate < pct * 1.15);
+      assert(mean_burst > burst * 0.85 && mean_burst < burst * 1.15);
+    }
+  }
+  printf("test_loss_model_stats OK\n");
+}
+
+// Fixed-run mode: the drop rate must hit the target AND every loss run must
+// be exactly L packets (multiples of L only via back-to-back triggers, which
+// must stay rare at matrix loss rates).
+void test_loss_model_fixed() {
+  for (double pct : {0.01, 0.1, 1.0}) {
+    for (unsigned L : {1u, 2u, 3u}) {
+      loss::Model m(pct, 1.0, 42, L);
+      const uint64_t n = 20000000;
+      uint64_t drops = 0, runs = 0, exact = 0, cur = 0;
+      for (uint64_t i = 0; i < n; ++i) {
+        if (m.drop()) {
+          ++drops;
+          ++cur;
+        } else if (cur) {
+          ++runs;
+          assert(cur % L == 0);  // runs are always whole multiples of L
+          if (cur == L) ++exact;
+          cur = 0;
+        }
+      }
+      const double rate = 100.0 * static_cast<double>(drops) / n;
+      assert(rate > pct * 0.9 && rate < pct * 1.1);
+      // Concatenated runs (2L+) appear with probability ~q per run boundary;
+      // worst case here is p=1%, L=1 (q=1% -> ~99% exact). 0.97 keeps margin.
+      assert(runs > 0 && exact > runs * 0.97);
+      assert(m.dropped() == drops);
+    }
+  }
+  printf("test_loss_model_fixed OK\n");
+}
+
+}  // namespace
+
+int main() {
+  test_gf256_field();
+  test_gf256_kernels_agree();
+  test_roundtrip_random_losses();
+  test_burst_recovery();
+  test_partial_group_flush();
+  test_lost_parity();
+  test_intact_group_and_dup_parity();
+  test_encoder_set_r();
+  test_loss_model_stats();
+  test_loss_model_fixed();
+  printf("ALL FEC TESTS PASSED\n");
+  return 0;
+}

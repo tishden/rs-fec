@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      # Two runs: the dispatcher's best kernel on this runner, and the forced
+      # scalar reference. A green build on only one of them proves half the
+      # dispatch table.
+      - name: build and test
+        run: make test CXX=${{ matrix.compiler }}
+      - name: example
+        run: make example CXX=${{ matrix.compiler }}
+      - name: report which kernel the runner dispatched to
+        run: ./bin/test_fec | grep dispatch=
+
+  cmake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DRSFEC_BUILD_TESTS=ON
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure

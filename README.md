@@ -3,9 +3,15 @@
 Systematic Reed-Solomon erasure coding over GF(256), for packet streams that
 cannot afford a round trip.
 
-Header-only C++17, no dependencies. Ships with an HLS mirror of the same codec
-that is proven byte-identical to the C++ one, so a host and an FPGA can encode
-and repair each other's packets.
+Header-only C++17, no dependencies. Runtime-dispatched SIMD kernels (SSSE3
+through GFNI/AVX-512) on x86-64; a portable scalar kernel everywhere else.
+
+> **Status: research code.** This is a pet project, published because the
+> measurements and the design notes may be useful to someone. It is tested
+> (every SIMD kernel is cross-checked against the scalar reference, including
+> under emulation in CI), but it is not a maintained library: the API may
+> change, the wire format carries no version field, and nothing here has been
+> through a security review. See [Status and limits](#status-and-limits).
 
 ```cpp
 #include <rsfec/fec.h>
@@ -14,13 +20,15 @@ fec::Params p;                       // k=8 data, r=2 parity, no interleaving
 fec::Encoder enc(p);
 std::vector<fec::Parity> parity;
 
-// Sender: feed every outgoing datagram. Completing a group appends r parity
-// packets to `parity`, which you put on the wire alongside the data.
+// Sender: feed every outgoing datagram, numbering them consecutively.
+// Completing a group appends r parity packets to `parity`, which you put on
+// the wire alongside the data. Call enc.poll(now_ns, parity) when idle, so a
+// partly filled group still gets its parity out.
 enc.feed(seq, datagram, len, now_ns, parity);
 
 // Receiver: feed everything that arrives. Reconstructed datagrams land in
 // `out` as soon as a group becomes solvable -- no round trip involved.
-fec::Decoder dec;                    // geometry is read off the parity packets
+fec::Decoder dec;                    // ~1.6 MB: heap-allocate it on small stacks
 std::vector<fec::Decoder::Recovered> out;
 dec.feed_data(seq, datagram, len, out);
 dec.feed_parity(par.first_seq, par.k_actual, par.depth, par.index,
@@ -29,6 +37,9 @@ dec.feed_parity(par.first_seq, par.k_actual, par.depth, par.index,
 
 A complete runnable version is [`examples/roundtrip.cpp`](examples/roundtrip.cpp)
 (`make example`), which drops two of eight packets and prints the rebuilt ones.
+The parity packet's header (`first_seq`, `k_actual`, `depth`, `index`,
+`coded_len`) is yours to serialise; the library only produces and consumes
+the fields.
 
 ## What it is for
 
@@ -73,14 +84,15 @@ The hot operation is `addmul(dst, src, n, c): dst[i] ^= c * src[i]`. Seven
 implementations of it are compiled into the binary and selected at runtime by
 CPUID, so a build made on an old machine still uses GFNI on a new one.
 
-Measured with `bench/bench_fec.cpp` (1400-byte packets):
+Measured with `bench/bench_fec.cpp` (1400-byte packets). Units are as
+Google Benchmark printed them on each machine; `--` means not measured.
 
 | kernel | AWS m7i (Sapphire Rapids) | i7-3820 (Sandy Bridge) |
 |---|---|---|
 | `scalar` | 2.61 GiB/s | 1.5 GB/s |
 | `ssse3` PSHUFB | -- | 10.3 GB/s |
 | `avx128` VEX PSHUFB | -- | 13.2 GB/s |
-| `avx2` | 33.8 GiB/s | dispatch-ready |
+| `avx2` | 33.8 GiB/s | not available |
 | `gfni128` | 25.0 GiB/s | not available |
 | `gfni_avx512` | 43.0 GiB/s | not available |
 | `gfni_avx2` | **47.6 GiB/s** | not available |
@@ -94,10 +106,10 @@ Two honest caveats from those runs:
 
 * **The dispatcher is not always right.** On m7i it picks `gfni_avx512`, which
   is ~10% *slower* than `gfni_avx2` there -- the usual 512-bit frequency
-  penalty. Pinning the kernel is a one-line change; auto-detecting this is not,
-  and has not been done.
-* **SIMD buys headroom, not median latency.** In the transport this came from,
-  `--fec-simd 1` vs `0` at 200-300k messages/s was p50 14.0 vs 13.9 us -- no
+  penalty. Pinning the kernel is one call, `gf256::force_kernel("gfni_avx2")`;
+  auto-detecting this is not, and has not been done.
+* **SIMD buys headroom, not median latency.** In an end-to-end UDP messaging
+  test at 200-300k messages/s, SIMD vs scalar was p50 14.0 vs 13.9 us -- no
   difference. The scalar kernel merely used ~70% of a core instead of ~4%. The
   threshold where it starts to matter was around 400k messages/s.
 
@@ -115,45 +127,33 @@ Cauchy matrix is invertible, which is exactly the erasure property: any `e <= r`
 missing units are recovered by subtracting the present ones from `e` parities
 and solving the resulting `e x e` system.
 
-## The HLS mirror
-
-`hls/` is the same codec for AMD/Xilinx Vitis HLS -- the encoder and the
-Gaussian-elimination decoder, written for synthesis (combinational GF multiply,
-banked accumulators, `II=1` byte loops).
-
-It is not a port that is *believed* to match. `hls/tb/tb_gf.cpp` checks all
-65536 products, all 255 inverses and the Cauchy coefficients against the C++
-implementation; `hls/tb/tb_fec.cpp` checks that the encoder's parity is
-byte-identical and that the decoder recovers every one of the C(8,2) loss pairs.
-Both run under plain `g++` -- the only thing Vitis HLS is needed for is its
-`ap_int.h`:
-
-```
-make -C hls tb HLS_INC=/path/to/Vitis_HLS/2024.1/include
-```
-
-(csim prints `Bitsize mismatch` warnings from `ap_int`'s runtime checks on the
-`^=` compound assignments. They are cosmetic; the values are verified against
-the golden implementation on every path.)
-
-This codec has run on silicon -- an Alveo U50 exchanging FEC-protected
-datagrams with a host running the C++ side of the same code.
-
 ## Build
+
+Needs GCC or Clang (per-function `target` attributes, GNU `cpuid.h`); MSVC is
+not supported. On x86-64 all kernels are compiled in and one is picked at
+runtime, with no `-m` flags needed. Elsewhere (CI runs arm64) only the scalar
+kernel exists.
 
 ```
 make test              # both dispatch ends: best-available kernel, and scalar
+make example
 make bench             # needs Google Benchmark
+make bench-cache       # no dependencies; meant for perf stat
 ```
 
 or
 
 ```
-cmake -B build -DRSFEC_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build
+cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-Header-only, so integrating is just an include path; a CMake `rsfec::rsfec`
-interface target is exported for convenience.
+Header-only, so integrating is just an include path. `cmake --install`
+exports a package, so a consumer can do:
+
+```cmake
+find_package(rsfec 0.1 REQUIRED)
+target_link_libraries(app PRIVATE rsfec::rsfec)
+```
 
 ## Compile-time bounds
 
@@ -166,11 +166,39 @@ Override with `-D`:
 | `FEC_MAX_R` | 8 | parity packets per group |
 | `FEC_MAX_DEPTH` | 16 | interleaving depth |
 | `FEC_WINDOW` | 1024 | decoder retention ring, slots (power of two) |
+| `FEC_MAX_PENDING` | 64 | groups the decoder waits on; oldest evicted when full |
 | `FEC_NO_SIMD` | -- | force the scalar kernel |
 
 `FEC_WINDOW` is the one that decides whether the receive path fits in cache:
 1024 slots is 1.5 MB. An earlier 8192 was 12 MB -- larger than the last-level
 cache of the machines this ran on, so the ring evicted itself every lap.
+
+## Status and limits
+
+What has been checked, and what has not:
+
+* **Correctness** is covered by `tests/test_fec.cpp`: field axioms, every
+  runnable kernel against scalar, round trips over k/r/depth with random,
+  burst, partial-group and lost-parity patterns, and regressions for each bug
+  fixed so far. CI runs it with GCC and Clang, on x86-64 and arm64, under
+  ASan/UBSan, and under Intel SDE so the GFNI and AVX-512 kernels are
+  exercised even when the runner lacks them.
+* **Sequence numbers** must number the data stream. Membership in a group is
+  positional, so the encoder closes a group early on any gap, repeat or reset
+  rather than guess; you lose some protection around the gap, never
+  correctness.
+* **Datagrams above `FEC_MAX_UNIT`** are refused by `Encoder::feed` (it
+  returns `false`); send them unprotected.
+* **Untrusted input.** The decoder's memory is bounded (`FEC_WINDOW`,
+  `FEC_MAX_PENDING`) and malformed parity cannot make it read or write out of
+  bounds, but there is no authentication: whoever can inject parity packets
+  can make it reconstruct garbage. Authenticate below this layer if that
+  matters.
+* **No wire-format version.** The coded unit layout and the Cauchy
+  construction are stable in practice but not promised before 1.0.
+* **Not thread-safe per object.** One `Encoder` / `Decoder` per thread;
+  `gf256::force_kernel` must be called before coding starts.
+* **Performance numbers** above are from the machines named, not from CI.
 
 ## Also here
 
@@ -183,7 +211,8 @@ why it exists instead of `netem`.
 ## License and contributing
 
 Apache-2.0, Copyright 2026 Denis Tishkov. Contributions require a signed CLA —
-see [CONTRIBUTING.md](CONTRIBUTING.md).
+see [CONTRIBUTING.md](CONTRIBUTING.md). If you use this in academic work,
+[CITATION.cff](CITATION.cff) has the citation.
 
-Written with Claude (Anthropic). The design decisions, the measurements and
-the silicon runs are mine; the code was written in collaboration with it.
+Written with Claude (Anthropic). The design decisions and the measurements
+are mine; the code was written in collaboration with it.

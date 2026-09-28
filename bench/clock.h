@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Denis Tishkov
 
-// Monotonic-ish wall clock for the microbenchmarks. Deliberately the same
-// CLOCK_REALTIME reading the transport this codec came from uses to stamp
-// messages, so a benchmark number and a production latency sample are drawn
-// from one clock.
+// Wall clock for the microbenchmarks. CLOCK_REALTIME rather than a monotonic
+// clock so that numbers are comparable with latency samples stamped by
+// applications, which is what those usually use; the runs are far shorter
+// than any clock adjustment.
 #pragma once
 
 #include <chrono>

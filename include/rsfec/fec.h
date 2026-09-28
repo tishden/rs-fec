@@ -22,6 +22,17 @@
 // so a loss is repaired as soon as enough of the group has arrived --
 // typically microseconds after the loss, versus an RTT-scale NACK retransmit.
 //
+// Sequence numbers: group membership is positional (member j of a group is
+// first_seq + j*depth), so the encoder needs to know which seqs are adjacent.
+// Feed seqs that number the data stream consecutively. A gap, repeat or
+// reset is tolerated -- the affected group is closed early, exactly like a
+// flush, and a new one opens at the new seq -- it just costs a short group.
+//
+// Trust: the decoder bounds its memory (FEC_MAX_PENDING) and never reads or
+// writes out of bounds on malformed parity, but it has no authentication.
+// Anyone who can inject parity packets can make it reconstruct garbage;
+// authenticate the stream below this layer if that matters.
+//
 // ============================================================================
 // Parameters and what they buy (runtime Params, bounded at compile time)
 // ============================================================================
@@ -49,7 +60,7 @@
 //
 // Residual failure (> r losses in a group) at iid loss p is
 // ~ C(k+r, r+1) p^(r+1): for k=8 r=2 at p=1% that is ~1e-4 per group, ~1e-5
-// per packet -- pair with a NACK fallback if delivery must be complete.
+// per packet -- pair with a retransmit fallback if delivery must be complete.
 //
 // ============================================================================
 // Wire format of one coded unit
@@ -77,7 +88,10 @@
 // ~(k_present * e + e^2) addmul passes over one group. With the SSSE3 kernel
 // an addmul over a 1400-byte unit is ~100ns; k=8 r=2 encode adds ~200ns per
 // data packet. Buffers are preallocated; no heap traffic on the hot path
-// (Decoder::pending_ is a vector but reserved up front).
+// (Decoder::pending_ is a vector, reserved up front to FEC_MAX_PENDING).
+//
+// Unit lengths ride in a u16, so a zero-length datagram is a valid unit and
+// is recovered like any other.
 //
 // Compile-time bounds (override with -D):
 //   FEC_MAX_UNIT   max datagram size codable            (default 1500)
@@ -91,14 +105,19 @@
 //                  Each slot costs FEC_MAX_UNIT bytes, so this is the single
 //                  number that decides whether the receive path fits in cache:
 //                  1024 slots is 1.5 MB, the former 8192 was 12 MB -- more
-//                  than the last-level cache of the machines we run on, so
-//                  the ring evicted itself on every lap.
+//                  than the last-level cache of the machines it was measured
+//                  on, so the ring evicted itself on every lap.
+//   FEC_MAX_PENDING  groups the decoder keeps waiting for more packets
+//                  (default 64). When full, the oldest is abandoned. This is
+//                  what bounds decoder memory against a stream of parity for
+//                  groups whose data never arrives.
 //   FEC_NO_SIMD    force the scalar GF kernel
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "rsfec/gf256.h"
@@ -118,6 +137,9 @@
 #ifndef FEC_WINDOW
 #define FEC_WINDOW 1024
 #endif
+#ifndef FEC_MAX_PENDING
+#define FEC_MAX_PENDING 64
+#endif
 
 namespace fec {
 
@@ -126,6 +148,7 @@ inline constexpr uint32_t kMaxK = FEC_MAX_K;
 inline constexpr uint32_t kMaxR = FEC_MAX_R;
 inline constexpr uint32_t kMaxDepth = FEC_MAX_DEPTH;
 inline constexpr uint32_t kWindow = FEC_WINDOW;
+inline constexpr uint32_t kMaxPending = FEC_MAX_PENDING;
 inline constexpr uint32_t kUnitCap = 2 + kMaxUnit;  // [u16 len | bytes]
 // Parity rows are padded to whole cache lines (see Encoder::Group).
 inline constexpr uint32_t kAccStride = (kUnitCap + 63) / 64 * 64;
@@ -133,6 +156,9 @@ inline constexpr uint32_t kAccStride = (kUnitCap + 63) / 64 * 64;
 static_assert(kMaxK + kMaxR <= 200, "Cauchy points must stay distinct");
 static_assert((kWindow & (kWindow - 1)) == 0, "FEC_WINDOW must be pow2");
 static_assert(kWindow >= 2 * kMaxK * kMaxDepth, "window smaller than a block");
+static_assert(kMaxUnit <= 0xffff - 2, "unit length and coded_len are u16");
+static_assert(kMaxK <= 0xff && kMaxDepth <= 0xff, "k and depth ride in u8");
+static_assert(kMaxPending >= kMaxDepth, "one pending group per open group");
 
 struct Params {
   uint16_t k = 8;
@@ -170,28 +196,59 @@ class Encoder {
   struct Stats {
     uint64_t groups_full = 0;   // closed by reaching k
     uint64_t groups_flushed = 0;  // closed by flush timeout
+    uint64_t groups_cut = 0;      // closed early by a seq gap/repeat/reset
+    uint64_t rejected = 0;        // datagrams longer than FEC_MAX_UNIT
     uint64_t parity_out = 0;
     uint64_t parity_bytes = 0;
   };
 
-  explicit Encoder(const Params& p) : p_(p), r_now_(p.r) {
+  // Throws std::invalid_argument unless p.valid().
+  explicit Encoder(const Params& p) : p_(checked(p)), r_now_(p.r) {
     for (auto& g : groups_) g.open = false;
+    for (uint32_t d = 0; d < kMaxDepth; ++d) slot_[d] = static_cast<uint8_t>(d);
+    spare_ = kMaxDepth;
   }
 
   // Adjust the parity count for groups opened from now on (capped at the
   // configured r; 0 suspends parity emission entirely). Safe mid-stream: a
   // group carries its own parity set and the decoder works per group, so the
   // sender may cheapen redundancy under load and restore it when pressure
-  // subsides (see the sender's --fec-adapt policy).
+  // subsides.
   void set_r(uint16_t r) { r_now_ = r < p_.r ? r : p_.r; }
   uint16_t current_r() const { return r_now_; }
 
-  // Feed one outgoing data datagram (seq must be the strictly increasing wire
-  // pkt_seq). Emitted parity packets, if the packet completed a group, are
-  // appended to `out`.
-  void feed(uint64_t seq, const uint8_t* pkt, uint32_t len, uint64_t now_ns,
+  // Feed one outgoing data datagram. seq should number the data stream
+  // consecutively (see "Sequence numbers" above). Emitted parity packets, if
+  // the packet closed a group, are appended to `out`.
+  //
+  // Returns false, and codes nothing, for a datagram longer than
+  // FEC_MAX_UNIT: it still goes on the wire but is not protected. The seq it
+  // occupied then reads as a gap, which closes its group early, so the
+  // decoder never mistakes a neighbour for it.
+  bool feed(uint64_t seq, const uint8_t* pkt, uint32_t len, uint64_t now_ns,
             std::vector<Parity>& out) {
-    Group& g = groups_[seq % p_.depth];
+    if (len > kMaxUnit) {
+      ++stats_.rejected;
+      return false;
+    }
+    const uint32_t d = static_cast<uint32_t>(seq % p_.depth);
+    // Membership is positional: the decoder will look for member j at
+    // first_seq + j*depth. A seq that is not that slot would be attributed
+    // to the wrong packet on recovery, so close what we have instead. The
+    // closed group's rows are the parity just handed out, so the new group
+    // takes the spare buffer rather than overwriting them in this same call.
+    {
+      Group& old = groups_[slot_[d]];
+      if (old.open &&
+          seq != old.first_seq + static_cast<uint64_t>(old.count) * p_.depth) {
+        close(old, out);
+        ++stats_.groups_cut;
+        const uint8_t t = slot_[d];
+        slot_[d] = spare_;
+        spare_ = t;
+      }
+    }
+    Group& g = groups_[slot_[d]];
     if (!g.open) {
       g.open = true;
       g.first_seq = seq;
@@ -237,13 +294,14 @@ class Encoder {
       close(g, out);
       ++stats_.groups_full;
     }
+    return true;
   }
 
   // Close overdue partial groups (call regularly from the idle loop).
   void poll(uint64_t now_ns, std::vector<Parity>& out) {
     const uint64_t flush_ns = static_cast<uint64_t>(p_.flush_us) * 1000;
     for (uint32_t d = 0; d < p_.depth; ++d) {
-      Group& g = groups_[d];
+      Group& g = groups_[slot_[d]];
       if (g.open && g.count > 0 && now_ns - g.open_ts >= flush_ns) {
         close(g, out);
         ++stats_.groups_flushed;
@@ -267,6 +325,11 @@ class Encoder {
     alignas(64) uint8_t acc[kMaxR][kAccStride];
   };
 
+  static const Params& checked(const Params& p) {
+    if (!p.valid()) throw std::invalid_argument("fec::Params out of range");
+    return p;
+  }
+
   void close(Group& g, std::vector<Parity>& out) {
     const uint16_t coded_len = static_cast<uint16_t>(2 + g.max_len);
     for (uint32_t i = 0; i < g.r; ++i) {
@@ -282,7 +345,12 @@ class Encoder {
 
   Params p_;
   uint16_t r_now_;
-  Group groups_[kMaxDepth];
+  // One buffer per interleave lane plus a spare that a cut group retires
+  // into; slot_ maps lane -> buffer. Indices, not pointers, so the Encoder
+  // stays copyable.
+  Group groups_[kMaxDepth + 1];
+  uint8_t slot_[kMaxDepth];
+  uint8_t spare_;
   Stats stats_;
 };
 
@@ -292,8 +360,9 @@ class Encoder {
 // Keeps a ring of the last FEC_WINDOW received datagrams (reconstruction
 // needs the group's surviving packets), and a small list of groups that are
 // waiting for enough packets to solve. Groups that fall behind the stream by
-// more than a window are abandoned (`unrecoverable`) -- the NACK layer, if
-// enabled, remains responsible for them.
+// more than half a window, or are pushed out of a full pending list, are
+// abandoned (`unrecoverable`) -- a retransmit layer, if there is one, remains
+// responsible for them.
 class Decoder {
  public:
   struct Stats {
@@ -301,6 +370,7 @@ class Decoder {
     uint64_t groups_solved = 0;      // groups that needed reconstruction
     uint64_t groups_intact = 0;      // parity arrived but nothing was missing
     uint64_t unrecoverable = 0;      // groups abandoned (losses > parity)
+    uint64_t evicted = 0;            // of those, pushed out by FEC_MAX_PENDING
     uint64_t parity_rx = 0;
     uint64_t parity_dup = 0;
   };
@@ -315,10 +385,10 @@ class Decoder {
 
   Decoder() {
     for (auto& s : window_) s.seq = kNoSeq;
-    pending_.reserve(64);
+    pending_.reserve(kMaxPending);
   }
 
-  // Feed every received data datagram (including ones NACK brought back).
+  // Feed every received data datagram (including retransmitted ones).
   // May complete a pending group: reconstructed packets land in `out`.
   void feed_data(uint64_t seq, const uint8_t* pkt, uint32_t len,
                  std::vector<Recovered>& out) {
@@ -332,7 +402,7 @@ class Decoder {
     for (size_t i = 0; i < pending_.size();) {
       PGroup& g = pending_[i];
       if (member_pos(g, seq) >= 0 && try_solve(g, out)) {
-        pending_.erase(pending_.begin() + i);
+        remove_at(i);
         continue;
       }
       ++i;
@@ -354,6 +424,7 @@ class Decoder {
       if (p.first_seq == first_seq) { g = &p; break; }
     }
     if (!g) {
+      if (pending_.size() == kMaxPending) evict_oldest();
       pending_.emplace_back();
       g = &pending_.back();
       g->first_seq = first_seq;
@@ -370,11 +441,7 @@ class Decoder {
     std::memcpy(g->par[g->n_par], coded, coded_len);
     ++g->n_par;
 
-    if (try_solve(*g, out)) {
-      for (size_t i = 0; i < pending_.size(); ++i) {
-        if (&pending_[i] == g) { pending_.erase(pending_.begin() + i); break; }
-      }
-    }
+    if (try_solve(*g, out)) remove_at(static_cast<size_t>(g - pending_.data()));
     gc();
   }
 
@@ -412,7 +479,21 @@ class Decoder {
     return s.seq == seq ? &s : nullptr;
   }
 
+  // Order of pending_ carries no meaning, so removal is a swap with the last
+  // entry rather than an erase that shifts every later ~12 KB group down.
+  void remove_at(size_t i) {
+    if (i + 1 != pending_.size()) pending_[i] = pending_.back();
+    pending_.pop_back();
+  }
 
+  void evict_oldest() {
+    size_t oldest = 0;
+    for (size_t i = 1; i < pending_.size(); ++i)
+      if (pending_[i].first_seq < pending_[oldest].first_seq) oldest = i;
+    remove_at(oldest);
+    ++stats_.unrecoverable;
+    ++stats_.evicted;
+  }
 
   // Attempt reconstruction. True if the group is finished (solved or intact).
   bool try_solve(PGroup& g, std::vector<Recovered>& out) {
@@ -494,7 +575,7 @@ class Decoder {
       for (uint32_t a = 0; a < e; ++a)
         gf256::addmul(unit, g.par[a], coded_len, id[b][a]);
       const uint32_t len = unit[0] | (unit[1] << 8);
-      if (len == 0 || len > kMaxUnit || len + 2u > coded_len) continue;
+      if (len > kMaxUnit || len + 2u > coded_len) continue;
       const uint64_t seq =
           g.first_seq + static_cast<uint64_t>(miss[b]) * g.depth;
       Slot& s = window_[seq & (kWindow - 1)];
@@ -516,7 +597,7 @@ class Decoder {
           g.first_seq + static_cast<uint64_t>(g.k) * g.depth + kWindow / 2;
       if (max_seq_ > horizon) {
         ++stats_.unrecoverable;
-        pending_.erase(pending_.begin() + i);
+        remove_at(i);
         continue;
       }
       ++i;

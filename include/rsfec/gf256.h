@@ -43,10 +43,24 @@
 // can measure each one. FEC_NO_SIMD forces scalar dispatch.
 //
 // All lookup tables (~73 KB) are built once, lazily, at first use.
+//
+// Portability: needs GCC or Clang (per-function target attributes, GNU
+// cpuid). The SIMD kernels are x86-64/i386 only; on any other architecture
+// the header compiles to the scalar kernel alone, which is byte-identical
+// by construction, just slower.
 #pragma once
 
+#if !defined(__GNUC__)
+#error "rsfec/gf256.h needs GCC or Clang"
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+#define GF256_X86 1
 #include <cpuid.h>
 #include <immintrin.h>
+#else
+#define GF256_X86 0
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -111,6 +125,7 @@ enum Caps : uint32_t {
 inline uint32_t caps() {
   static const uint32_t c = [] {
     uint32_t r = 0;
+#if GF256_X86
     unsigned a, b, cx, d;
     if (!__get_cpuid(1, &a, &b, &cx, &d)) return r;
     if (cx & (1u << 9)) r |= kSSSE3;
@@ -130,6 +145,7 @@ inline uint32_t caps() {
       if (c7 & (1u << 8)) r |= kGFNI;
       if ((b7 & (1u << 30)) && zmm_os) r |= kAVX512BW;
     }
+#endif  // GF256_X86
 #ifdef FEC_NO_SIMD
     r = 0;
 #endif
@@ -170,6 +186,7 @@ inline void addmul2_scalar(uint8_t* d0, uint8_t* d1, const uint8_t* src,
   }
 }
 
+#if GF256_X86
 // ---------------------------------------------------------------------------
 // PSHUFB split-nibble kernels. The 16/32-byte bodies are macro-shared between
 // the SSSE3 and VEX (avx128) builds -- identical intrinsics, different
@@ -441,6 +458,8 @@ addmul2_gfni_avx512(uint8_t* d0, uint8_t* d1, const uint8_t* src, size_t n,
   }
 }
 
+#endif  // GF256_X86
+
 // ---------------------------------------------------------------------------
 // Registry and dispatch
 // ---------------------------------------------------------------------------
@@ -458,6 +477,7 @@ struct KernelInfo {
 // Best-first. kernel_table()[i].need & ~caps() == 0 => runnable.
 inline const KernelInfo* kernel_table(size_t* n) {
   static const KernelInfo k[] = {
+#if GF256_X86
       {"gfni_avx512", addmul_gfni_avx512, addmul2_gfni_avx512,
        kGFNI | kAVX512BW},
       {"gfni_avx2", addmul_gfni_avx2, addmul2_gfni_avx2, kGFNI | kAVX2},
@@ -465,16 +485,18 @@ inline const KernelInfo* kernel_table(size_t* n) {
       {"avx2", addmul_avx2, addmul2_avx2, kAVX2},
       {"avx128", addmul_avx128, addmul2_avx128, kAVX},
       {"ssse3", addmul_ssse3, addmul2_ssse3, kSSSE3},
+#endif
       {"scalar", addmul_scalar, addmul2_scalar, 0},
   };
   *n = sizeof(k) / sizeof(k[0]);
   return k;
 }
 
-// Runtime override (--fec-simd): lets one binary produce the "+SIMD" and
-// "-SIMD" rows of the final matrix. Must be set before the first FEC call;
-// the extra pointer check is one predicted-not-taken branch per addmul --
-// noise against the O(n) kernel body.
+// Runtime override: lets one binary be measured with and without SIMD, or
+// pin a kernel the auto-pick gets wrong (see README: on Sapphire Rapids the
+// 512-bit kernel loses to gfni_avx2). Not synchronised -- set it before any
+// thread starts coding. The extra pointer check is one predicted-not-taken
+// branch per addmul, noise against the O(n) kernel body.
 inline const KernelInfo*& kernel_override() {
   static const KernelInfo* k = nullptr;
   return k;
@@ -483,7 +505,7 @@ inline const KernelInfo*& kernel_override() {
 // name = "scalar"/"ssse3"/.../"gfni_avx512"; false if unknown or the CPU
 // lacks the required features. nullptr/"auto" clears the override.
 inline bool force_kernel(const char* name) {
-  if (!name || !*name || strcmp(name, "auto") == 0) {
+  if (!name || !*name || std::strcmp(name, "auto") == 0) {
     kernel_override() = nullptr;
     return true;
   }

@@ -6,18 +6,23 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
         compiler: [g++, clang++]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       # Two runs: the dispatcher's best kernel on this runner, and the forced
       # scalar reference. A green build on only one of them proves half the
-      # dispatch table.
+      # dispatch table. On arm64 both are the scalar kernel -- the point
+      # there is that the header builds and codes correctly off x86.
       - name: build and test
         run: make test CXX=${{ matrix.compiler }}
       - name: example
@@ -25,10 +30,55 @@ jobs:
       - name: report which kernel the runner dispatched to
         run: ./bin/test_fec | grep dispatch=
 
+  # Every SIMD kernel against scalar, whatever CPU the runner happens to be
+  # on: Intel SDE emulates Sapphire Rapids, which has GFNI and AVX-512.
+  simd-emulated:
+    runs-on: ubuntu-latest
+    env:
+      SDE_URL: https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch Intel SDE
+        run: |
+          mkdir -p sde
+          curl -sSfL "$SDE_URL" | tar -xJ -C sde --strip-components=1
+      - run: make bin/test_fec
+      - name: all kernels under SDE (Sapphire Rapids)
+        run: |
+          ./sde/sde64 -spr -- ./bin/test_fec | tee sde.log
+          for k in gfni_avx512 gfni_avx2 gfni128 avx2 avx128 ssse3; do
+            grep -q "kernel $k *OK" sde.log || { echo "kernel $k not exercised"; exit 1; }
+          done
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ASan + UBSan
+        run: |
+          make test CXX=clang++ \
+            CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+
   cmake:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -B build -DRSFEC_BUILD_TESTS=ON
+      # Release defines NDEBUG; the tests must still check (they use CHECK,
+      # not assert).
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PWD/prefix
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
+      - name: install, then consume with find_package
+        run: |
+          cmake --install build
+          mkdir consumer && cp examples/roundtrip.cpp consumer/
+          cat > consumer/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer CXX)
+          find_package(rsfec 0.1 REQUIRED)
+          add_executable(roundtrip roundtrip.cpp)
+          target_link_libraries(roundtrip PRIVATE rsfec::rsfec)
+          EOF
+          cmake -S consumer -B consumer/build -DCMAKE_PREFIX_PATH=$PWD/prefix
+          cmake --build consumer/build
+          ./consumer/build/roundtrip

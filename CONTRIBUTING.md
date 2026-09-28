@@ -34,18 +34,21 @@ fast. Two things follow.
 
 **Anything touching arithmetic must be proven against the reference.** The
 scalar kernel in `gf256.h` is the definition of correct; `tests/test_fec.cpp`
-cross-checks every runnable SIMD kernel against it, and `hls/tb/` does the same
-for the FPGA mirror. A new kernel that is not in that cross-check is not
-finished. Run both dispatch ends:
+cross-checks every runnable SIMD kernel against it. A new kernel that is not in
+that cross-check is not finished. CI runs it under Intel SDE, so a kernel your
+machine cannot run still gets exercised there. Run both dispatch ends:
 
 ```
 make test          # best available kernel, and FEC_NO_SIMD scalar
 ```
 
 **Wire-format changes are breaking changes.** The coded unit layout and the
-Cauchy construction are what let a host and an FPGA repair each other's
-packets. If a change alters the bytes, say so explicitly in the PR — it needs a
-version bump, not a patch release.
+Cauchy construction are what let two independently built peers repair each
+other's packets. If a change alters the bytes, say so explicitly in the PR — it
+needs a version bump, not a patch release.
+
+**Bug fixes come with a test** that fails without the fix. Use `CHECK`, not
+`assert`: the tests must still check something in a Release build.
 
 Performance claims want a number and the machine it came from. "Faster" without
 either is not reviewable; `bench/bench_fec.cpp` exists for this.

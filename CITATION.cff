@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "rsfec: systematic Reed-Solomon erasure coding over GF(256)"
+type: software
+authors:
+  - family-names: Tishkov
+    given-names: Denis
+version: 0.1.0
+date-released: 2026-09-28
+license: Apache-2.0
+repository-code: "https://github.com/tishden/rs-fec"
+abstract: >-
+  Header-only C++17 systematic Reed-Solomon (Cauchy) erasure code over
+  GF(256) for low-latency packet streams, with runtime-dispatched SIMD
+  kernels from SSSE3 to GFNI/AVX-512, interleaving for burst tolerance,
+  and a deterministic Gilbert-Elliott loss model for reproducible
+  experiments.
+keywords:
+  - forward error correction
+  - erasure coding
+  - Reed-Solomon
+  - Cauchy matrix
+  - GF(256)
+  - GFNI
+  - SIMD

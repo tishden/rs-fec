@@ -3,17 +3,16 @@
 
 // Cache behaviour of the FEC codec, isolated from the network.
 //
-// The end-to-end runs say the decoder costs about 0.34 extra cache misses per
-// message (0.107 on a clean receive against 0.448 with FEC, measured on bare
-// metal). That number cannot be optimised against directly -- it mixes the
-// codec with everything else the receiver does. This benchmark runs the codec
+// End-to-end measurements put the decoder at about 0.34 extra cache misses
+// per message (0.107 on a clean receive against 0.448 with FEC, bare metal).
+// That number cannot be optimised against directly -- it mixes the codec with
+// everything else a receiving application does. This benchmark runs the codec
 // alone over a realistic packet stream so `perf stat` attributes misses to it,
 // and prints ns and bytes per packet so a change can be judged on both.
 //
-// No google-benchmark dependency on purpose: it has to build anywhere the
-// transport builds.
+// No google-benchmark dependency on purpose, so it builds anywhere.
 //
-//   make bin/bench_fec_cache
+//   make bench-cache
 //   perf stat -e cache-references,cache-misses ./bin/bench_fec_cache decode ...
 //
 // Args: <encode|decode> <k> <r> <depth> <unit_bytes> <packets>
@@ -70,7 +69,8 @@ int run_decode(const fec::Params& p, uint32_t unit, uint32_t n) {
   // that makes the decoder do its work.
   auto pkts = make_packets(n, unit);
   fec::Encoder enc(p);
-  // 12 MB of retention ring -- heap, not stack (the receiver does the same).
+  // The retention ring is FEC_WINDOW * FEC_MAX_UNIT (1.5 MB by default) --
+  // heap, not stack.
   auto decp = std::make_unique<fec::Decoder>();
   fec::Decoder& dec = *decp;
   std::vector<fec::Parity> parity;
@@ -94,8 +94,16 @@ int run_decode(const fec::Params& p, uint32_t unit, uint32_t n) {
   size_t pi = 0;
   for (uint32_t i = 0; i < n; ++i) {
     rec.clear();
-    if (i % p.k != 0) dec.feed_data(i, pkts[i].data(), unit, rec);
-    while (pi < pars.size() && pars[pi].seq <= i) {
+    // Drop the first member of every group: the first `depth` packets of
+    // each k*depth block, one per interleaved group.
+    if (i % (uint32_t(p.k) * p.depth) >= p.depth)
+      dec.feed_data(i, pkts[i].data(), unit, rec);
+    // Parity goes out when its group closes, i.e. after the group's last
+    // member. Delivering it any earlier lets the decoder "recover" members
+    // that are merely still on their way, which is extra work a real stream
+    // does not do.
+    while (pi < pars.size() &&
+           pars[pi].seq + uint64_t(pars[pi].k - 1) * pars[pi].depth <= i) {
       const Par& q = pars[pi];
       dec.feed_parity(q.seq, q.k, q.depth, q.idx, par_bytes[q.at].data(), q.len,
                       rec);

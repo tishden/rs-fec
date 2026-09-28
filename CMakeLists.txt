@@ -3,27 +3,43 @@ cmake_minimum_required(VERSION 3.16)
 project(rsfec VERSION 0.1.0 LANGUAGES CXX
         DESCRIPTION "Systematic Reed-Solomon erasure coding over GF(256)")
 
-option(RSFEC_BUILD_TESTS "Build the test binary" ON)
+# Tests default on only when rsfec is the top-level project, not when it is
+# pulled in with add_subdirectory/FetchContent.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(_rsfec_top ON)
+else()
+  set(_rsfec_top OFF)
+endif()
+option(RSFEC_BUILD_TESTS "Build the tests and the example" ${_rsfec_top})
 option(RSFEC_BUILD_BENCH "Build the Google Benchmark microbenchmarks" OFF)
 
-# Header-only: consumers just need the include path. -mssse3 is an interface
-# requirement rather than a hard one -- gf256.h compiles without it and falls
-# back to the scalar kernel, but every x86-64 CPU made since 2006 has SSSE3,
-# so the default is to let the dispatcher have its baseline SIMD kernel.
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Header-only: consumers just need the include path. No architecture flags
+# are imposed on them -- the SIMD kernels carry per-function target
+# attributes and are picked at runtime by CPUID, so a baseline build still
+# runs GFNI on hardware that has it.
 add_library(rsfec INTERFACE)
 add_library(rsfec::rsfec ALIAS rsfec)
 target_include_directories(rsfec INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(rsfec INTERFACE cxx_std_17)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-  target_compile_options(rsfec INTERFACE -mssse3)
-endif()
 
-include(GNUInstallDirs)
 install(DIRECTORY include/rsfec DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS rsfec EXPORT rsfecTargets)
 install(EXPORT rsfecTargets NAMESPACE rsfec::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rsfec)
+# find_package(rsfec) needs a Config file next to the exported targets.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/rsfecConfig.cmake
+     "include(\"\${CMAKE_CURRENT_LIST_DIR}/rsfecTargets.cmake\")\n")
+# Pre-1.0: the wire format may still change between minor versions.
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/rsfecConfigVersion.cmake
+  COMPATIBILITY SameMinorVersion ARCH_INDEPENDENT)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/rsfecConfig.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/rsfecConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rsfec)
 
 if(RSFEC_BUILD_TESTS)
@@ -39,9 +55,7 @@ if(RSFEC_BUILD_TESTS)
   target_link_libraries(test_fec_scalar PRIVATE rsfec)
   target_compile_definitions(test_fec_scalar PRIVATE FEC_NO_SIMD)
   add_test(NAME test_fec_scalar COMMAND test_fec_scalar)
-endif()
 
-if(RSFEC_BUILD_TESTS)
   add_executable(roundtrip examples/roundtrip.cpp)
   target_link_libraries(roundtrip PRIVATE rsfec)
   add_test(NAME example_roundtrip COMMAND roundtrip)
